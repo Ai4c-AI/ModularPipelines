@@ -1,0 +1,211 @@
+# Run reports and history
+
+ModularPipelines can write a schema-versioned JSON report after every pipeline run. Reports contain pipeline and module statuses, timings, skip reasons, exception details, command counts, execution metrics, duration changes from the previous retained run, and correlation metadata.
+
+## Write a report[​](#write-a-report "Direct link to Write a report")
+
+Configure an explicit output path on the pipeline builder:
+
+```
+using ModularPipelines.Extensions;
+
+
+
+var builder = Pipeline.CreateBuilder(args);
+
+builder.WriteRunReport("artifacts/run-report.json");
+```
+
+Known CI systems automatically write `artifacts/run-report.json` when no explicit path is set. To disable that behavior while keeping an explicitly configured path available, set `AutoWriteInCi`:
+
+```
+builder.ConfigureOptions(options => options with
+
+{
+
+    RunReport = options.RunReport with
+
+    {
+
+        AutoWriteInCi = false,
+
+    },
+
+});
+```
+
+Relative report and history paths are resolved from the Git repository root when it is available. Outside a Git repository, they are resolved from the application base directory. This keeps the same storage location when a pipeline is launched from different working directories.
+
+The current schema version is available as `PipelineRunReport.CurrentSchemaVersion`. The completed report is also exposed through `PipelineSummary.RunReport`. After a successful write, an information log records the report's resolved path.
+
+Each report has a unique `RunId`, `RunCorrelation` metadata for the machine and detected build system, and the previous run's finish time when it supplies a duration-delta baseline. Registering the Git or GitHub integration also adds the available commit, branch, and CI run URL. Correlation strings pass through secret obfuscation before persistence.
+
+## Inspect distributed utilization[​](#inspect-distributed-utilization "Direct link to Inspect distributed utilization")
+
+Schema v5 adds `PipelineRunReport.Distributed` when the master collected distributed worker telemetry. It contains:
+
+* each module's worker index, queue-wait time, execution interval, and measured overhead for assignment/dependency-result transfer, dependency-result processing, artifact download/upload, and result collection;
+* each worker's module count, busy and idle durations, and utilization percentage; and
+* utilization across the configured worker fleet, including workers that executed no modules.
+
+Worker busy time spans assignment claim through result serialization, so dependency processing and artifact transfer count as useful worker activity. Module intervals and worker indexes provide the per-worker timeline. The final console output also calls out fleet idle percentage and the module with the longest queue wait. Concurrent modules contribute the union of their intervals to worker busy time, so utilization measures whether a worker is active, not how many of its slots are occupied.
+
+Dependency transfer measures waits for referenced results, including the worker cache; processing measures deserialization and application separately. Queue wait and result transfer compare master and worker timestamps and assume synchronized clocks; negative differences are clamped to zero.
+
+## Include module output excerpts[​](#include-module-output-excerpts "Direct link to Include module output excerpts")
+
+Schema v4 adds the optional per-module `Output` excerpt. Module output is excluded by default. Opt in when reports need enough output to diagnose recent failures without opening the full CI log:
+
+```
+builder.ConfigureOptions(options => options with
+
+{
+
+    RunReport = options.RunReport with
+
+    {
+
+        IncludeModuleOutput = true,
+
+        MaxOutputBytesPerModule = 8 * 1024,
+
+    },
+
+});
+```
+
+Each module gets one shared UTF-8 byte budget across its `stdoutTail` and `stderrTail`; the newest output wins when the limit is reached. Console error and command-error output is retained in `stderrTail`, while console output and other module logs are retained in `stdoutTail`. Excerpts are taken only from secret-masked module buffers and are masked again when the report is created.
+
+When report writing is enabled, add application-specific metadata through a bounded `IRunReportEnricher`:
+
+```
+public sealed class DeploymentRunEnricher : IRunReportEnricher
+
+{
+
+    public ValueTask EnrichAsync(
+
+        RunReportEnrichmentContext context,
+
+        CancellationToken cancellationToken)
+
+    {
+
+        context.GitBranch ??= "deployment";
+
+        return ValueTask.CompletedTask;
+
+    }
+
+}
+
+
+
+builder.AddRunReportEnricher<DeploymentRunEnricher>();
+```
+
+Enrichers run sequentially in registration order. Use `??=` for fallback metadata so an earlier value survives. Overwrite an existing value only when the current source is authoritative; later authoritative enrichers take precedence. The built-in Git enricher fills gaps, while the GitHub enricher replaces Git values with CI-provided commit and branch metadata when available.
+
+## Local history and deltas[​](#local-history-and-deltas "Direct link to Local history and deltas")
+
+By default, the `IRunHistoryStore` saves reports under `.modularpipelines/run-history` on local and CI runs, even when JSON report writing is disabled. It retains the latest 20 reports and uses the newest compatible report to calculate module and total-duration deltas. When a previous duration exists, the final results table includes a `Δ previous` column. Deltas compare only successful runs and successful module executions, so failed or timed-out durations do not create false regressions on a later run. A footer below the table identifies the baseline run by its UTC finish time.
+
+Add the default history directory to `.gitignore` if you do not want to commit local run data:
+
+```
+.modularpipelines/run-history/
+```
+
+Configure or disable retention with `RunReportOptions`:
+
+```
+builder.ConfigureOptions(options => options with
+
+{
+
+    RunReport = options.RunReport with
+
+    {
+
+        HistoryDirectory = "artifacts/run-history",
+
+        HistoryRetention = 10, // Use 0 to disable history.
+
+        GlobalHistoryRetention = 100, // Use 0 for no global limit.
+
+        PipelineIdentity = "release-pipeline",
+
+    },
+
+});
+```
+
+History is partitioned by pipeline identity and pruning only removes files owned by the built-in history store. When `PipelineIdentity` is omitted, Modular Pipelines derives one from the registered module types; changing only the report path does not fork history. After each save, the default store applies the per-identity `HistoryRetention` limit, then keeps the newest `GlobalHistoryRetention` reports across all identities. The global limit supersedes the per-identity limit: a quieter identity can lose all of its history when newer reports from other identities fill the global pool. Set `GlobalHistoryRetention` to `0` when every identity must retain its own history, or use stable pipeline identities and separate history directories for independently bounded histories. A positive global limit must be at least as large as `HistoryRetention`. Report and history I/O failures are logged as warnings and do not replace a pipeline failure. Report and history files are published atomically, so cancellation or a failed write cannot replace a complete report with partial JSON. After each successful history save, the built-in store also removes atomic-write temporary files older than 24 hours while leaving recent files for concurrent writers.
+
+Query retained reports newest-first through `IRunHistoryStore`:
+
+```
+await foreach (var failedRun in historyStore.GetRunsAsync(new RunHistoryQuery
+
+{
+
+    PipelineIdentity = "release-pipeline",
+
+    MaxRuns = 10,
+
+    Since = DateTimeOffset.UtcNow.AddDays(-30),
+
+    Status = ModuleStatus.Failed,
+
+}, cancellationToken))
+
+{
+
+    // Inspect failedRun.
+
+}
+```
+
+`Since` is an inclusive cutoff on each run's start time. A run that started before the cutoff is excluded even if it completed after the cutoff.
+
+`GetLatestAsync(pipelineIdentity, cancellationToken)` remains available as an extension method over `GetRunsAsync`. The registered `IRunHistoryReader` provides measured, attributable module-duration samples from the latest runs:
+
+```
+var samples = await historyReader.GetModuleDurationTrendAsync(
+
+    moduleTypeName,
+
+    lastN: 10,
+
+    cancellationToken);
+```
+
+Configure `RunReportOptions.PipelineIdentity` before using `IRunHistoryReader`; the reader uses that identity to select the current pipeline's retained history. Schema-v1 reports remain queryable, but they have no run ID and are therefore omitted from duration trends.
+
+CI agents are often ephemeral, so restore the history directory from a cache before running the pipeline. For example, a GitHub Actions workflow can restore the newest cache for its branch and save the updated history under a run-specific key:
+
+```
+- uses: actions/cache@v4
+
+  with:
+
+    path: .modularpipelines/run-history
+
+    key: ${{ runner.os }}-modularpipelines-history-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    restore-keys: |
+
+      ${{ runner.os }}-modularpipelines-history-${{ github.ref_name }}-
+```
+
+## Custom history stores[​](#custom-history-stores "Direct link to Custom history stores")
+
+Implement `IRunHistoryStore` to keep reports in a database, object store, or another backend, then register it on the builder:
+
+```
+builder.AddRunHistoryStore<MyRunHistoryStore>();
+```
+
+The store returns matching reports newest-first and saves the completed current report. Custom stores own their retention behavior. Members added to `IRunHistoryStore` in future versions will come with default implementations, so existing stores keep compiling. Module output excerpts are omitted from reports passed to a custom store because user persistence code can register secrets while saving; the built-in file store retains the already-masked excerpts.
+
+In v4, custom stores implement `GetRunsAsync(RunHistoryQuery, CancellationToken)`. The former `GetLatestAsync` interface member is now an extension method, so stores need only implement the query operation and `SaveAsync`.
